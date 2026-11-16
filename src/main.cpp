@@ -1,4 +1,4 @@
-// meshbox-periph  --  branch carrier-v2, milestone V2-A
+// meshbox-periph  --  branch carrier-v2, milestone V2-A.1
 // One firmware for both carriers, selected by a hardware profile:
 //   hw 1 = "MeshtasticDisplay v1.0.0"   hw 2 = "MeshBox Carrier v2 rev C"
 //
@@ -8,6 +8,9 @@
 //   - per-pin polarity tables for the main expander (0x27) and the button breakout (0x26)
 //   - door sensor and breakout buttons as event sources
 //   - survives a missing / unpowered I2C bus
+// V2-A.1 (2026-11-16): start-up order from Rob's rev C notes (GPIO1/GPIO8 LOW at boot, expander
+//   output latches cleared before direction, no chip-side polarity inversion); longer wait for the
+//   USB console at boot; "?" now also prints the firmware version and hardware selection.
 // NOT in V2-A (stubs only): button rings (PCA9685), lock (ADR-11), screen.
 //
 // Frame (8 bytes): ver=1 | cmd | p2 | p3 | p4 | p5 | p6 | p7
@@ -37,7 +40,12 @@
 #define LINK_BAUD 115200
 #define SDA_PIN 5
 #define SCL_PIN 6
+#define FW_VERSION "V2-A.1"
 #define GPIO3_PIN 3            // v1: LED data.  v2: screen backlight (must be LOW at boot).
+
+#define V2_LED1_PIN 1          // v2 LED port 1 (D0). v1: J1 pin 11, bench strip 2 only.
+#define V2_LED2_PIN 8          // v2 LED port 2 (D9). v1: J1 pin 8, unused.
+#define BOOT_CONSOLE_WAIT_MS 1500
 
 #define MCP_MAIN 0x27
 #define MCP_BRK  0x26
@@ -151,7 +159,10 @@ static bool mcpWrite(uint8_t addr, uint8_t reg, uint8_t v) {
   Wire.beginTransmission(addr); Wire.write(reg); Wire.write(v); return Wire.endTransmission() == 0;
 }
 static void mcpInit(uint8_t addr) {
+  // The expander is NOT reset when the XIAO reboots, so clear anything a previous run left behind.
+  mcpWrite(addr, 0x14, 0x00); mcpWrite(addr, 0x15, 0x00);   // OLATA/B = 0 BEFORE direction (lock on GPA4 must never see a stale 1)
   mcpWrite(addr, 0x00, 0xFF); mcpWrite(addr, 0x01, 0xFF);   // IODIRA/B: all inputs (lock on GPA4 stays an input)
+  mcpWrite(addr, 0x02, 0x00); mcpWrite(addr, 0x03, 0x00);   // IPOLA/B: no inversion in the chip (polarity comes from the profile)
   mcpWrite(addr, 0x0C, 0x00); mcpWrite(addr, 0x0D, 0x00);   // GPPUA/B: no internal pull-ups (boards have their own)
   if (addr == MCP_BRK) mcpWrite(addr, 0x0A, 0x04);          // IOCON: INT pin open-drain (v2 main board has the pull-up)
 }
@@ -173,13 +184,20 @@ static uint8_t hwDetect() {
   if (!mainPresent || !mcpRead(MCP_MAIN, 0x13, gb)) return 0;
   return (gb & 0x04) ? 2 : 1;
 }
+static uint8_t hwSeenAtBoot = 0;
+// Report only: safe to call at any time ("?"). Never re-selects the profile.
+static void hwPrint() {
+  Serial.printf("firmware: meshbox-periph %s\n", FW_VERSION);
+  Serial.printf("hardware: using %s (setting=%u, detected at boot=%u)%s\n", prof->name, cfg.hw, hwSeenAtBoot,
+                (cfg.hw && hwSeenAtBoot && cfg.hw != hwSeenAtBoot) ? "  ** MISMATCH: check 'H' setting or USER button **" : "");
+  if (!cfg.hw && !hwSeenAtBoot) Serial.println("hardware: no expander answered at boot, defaulted to v1. Set 'H 2' on a v2 board.");
+}
+// Boot only: the profile is chosen once and never changed while running.
 static void hwSelect() {
-  uint8_t seen = hwDetect();
-  uint8_t use = cfg.hw ? cfg.hw : (seen ? seen : 1);
+  hwSeenAtBoot = hwDetect();
+  uint8_t use = cfg.hw ? cfg.hw : (hwSeenAtBoot ? hwSeenAtBoot : 1);
   prof = (use == 2) ? &PROFILE_V2 : &PROFILE_V1;
-  Serial.printf("hardware: using %s (setting=%u, detected=%u)%s\n", prof->name, cfg.hw, seen,
-                (cfg.hw && seen && cfg.hw != seen) ? "  ** MISMATCH: check 'H' setting or USER button **" : "");
-  if (!cfg.hw && !seen) Serial.println("hardware: no expander answered, defaulting to v1. Set 'H 2' on a v2 board.");
+  hwPrint();
 }
 
 // ---------------- strips + pattern engine ----------------
@@ -441,7 +459,7 @@ static void handleLine(const String &s) {
   const char *t = s.c_str() + 1;
   switch (s[0]) {
     case 'X': case 'x': patternStop(3, "console"); return;
-    case '?': cfgPrint(); i2cProbe(true); return;
+    case '?': hwPrint(); cfgPrint(); i2cProbe(true); return;
     case 'I': case 'i': i2cProbe(true); return;
     case 'E': case 'e': { int n = sscanf(t, "%d %d", &a, &b); if (n >= 1) { emitEvent((uint8_t)a, n == 2 ? (uint8_t)b : 0); return; } break; }
     case 'C': case 'c': { int n = sscanf(t, "%d %d %d %d %d", &a, &b, &c, &d, &e);
@@ -462,6 +480,10 @@ void setup() {
   // GPIO3 is the screen backlight on v2 and has no pull-down on rev C: hold it LOW before anything else.
   // On v1 the same pin is LED data, where idle-LOW is also correct.
   pinMode(GPIO3_PIN, OUTPUT); digitalWrite(GPIO3_PIN, LOW);
+  // v2 LED data lines feed 5 V buffers: hold them LOW until the LED library takes the pins over.
+  // On v1 both pins only reach J1 (pin 11 and pin 8), so this is harmless there.
+  pinMode(V2_LED1_PIN, OUTPUT); digitalWrite(V2_LED1_PIN, LOW);
+  pinMode(V2_LED2_PIN, OUTPUT); digitalWrite(V2_LED2_PIN, LOW);
 
   Serial.begin(115200);
   cfgLoad();
@@ -469,14 +491,14 @@ void setup() {
 
   Wire.begin(SDA_PIN, SCL_PIN);
   Wire.setTimeOut(50);
-  delay(300);                       // let USB CDC come up so the boot lines are visible
+  delay(BOOT_CONSOLE_WAIT_MS);      // give the USB console time to reconnect after a reset ("?" repeats the report anyway)
   i2cProbe(true);
   hwSelect();
   stripsSetup();
   bleSetup();
 
   randomSeed(esp_random());
-  Serial.printf("meshbox-periph V2-A ready (link rx=%d tx=%d)\n", LINK_RX_PIN, LINK_TX_PIN);
+  Serial.printf("meshbox-periph %s ready (link rx=%d tx=%d)\n", FW_VERSION, LINK_RX_PIN, LINK_TX_PIN);
   cfgPrint();
 }
 

@@ -1,4 +1,4 @@
-// meshbox-periph  --  branch carrier-v2, milestone V2-A.1
+// meshbox-periph  --  branch carrier-v2, milestone V2-L1 (V2-A.1 + lock L1 dry run)
 // One firmware for both carriers, selected by a hardware profile:
 //   hw 1 = "MeshtasticDisplay v1.0.0"   hw 2 = "MeshBox Carrier v2 rev C"
 //
@@ -11,6 +11,11 @@
 // V2-A.1 (2026-11-16): start-up order from Rob's rev C notes (GPIO1/GPIO8 LOW at boot, expander
 //   output latches cleared before direction, no chip-side polarity inversion); longer wait for the
 //   USB console at boot; "?" now also prints the firmware version and hardware selection.
+// V2-L1 (2026-11-17): lock milestone L1 of meshbox-lock-design-v1-2026-11-16.md. Signed open/cancel
+//   frames (19 bytes, HMAC-SHA256 truncated to 8) are verified and answered with a signed result.
+//   DRY RUN ON EVERY BOARD: no pin is driven; an accepted open prints a line and flashes green.
+//   Console: K (status) | K <boxid 8 hex> <secret 64 hex> (provision, counter -> 0) | K T (self-test) | K ERASE.
+//   Needs radio firmware L0 (ec7ccc4 or later) on this box: older radios cut frames to 8 bytes.
 // NOT in V2-A (stubs only): button rings (PCA9685), lock (ADR-11), screen.
 //
 // Frame (8 bytes): ver=1 | cmd | p2 | p3 | p4 | p5 | p6 | p7
@@ -30,6 +35,7 @@
 #include <Wire.h>
 #include <Preferences.h>
 #include <Adafruit_NeoPixel.h>
+#include <mbedtls/md.h>
 #ifndef MESHBOX_NO_BLE          // deployed builds: -D MESHBOX_NO_BLE  (ADR-11)
 #include <NimBLEDevice.h>
 #endif
@@ -40,7 +46,7 @@
 #define LINK_BAUD 115200
 #define SDA_PIN 5
 #define SCL_PIN 6
-#define FW_VERSION "V2-A.1"
+#define FW_VERSION "V2-L1"
 #define GPIO3_PIN 3            // v1: LED data.  v2: screen backlight (must be LOW at boot).
 
 #define V2_LED1_PIN 1          // v2 LED port 1 (D0). v1: J1 pin 11, bench strip 2 only.
@@ -329,6 +335,115 @@ static void eventReact(uint8_t source, uint8_t state) {
   }
 }
 
+// ---------------- lock (ADR-11; design v1 2026-11-16) -- milestone L1: DRY RUN ----------------
+// Frame, 19 bytes, little-endian: ver=1 | type | flags/result | box id (4) | counter (4) | mac (8)
+// mac = first 8 bytes of HMAC-SHA256(secret, bytes 0..10). Honoured only when it arrives over the radio link.
+#define LOCK_FRAME_LEN 19
+#define LOCK_CMD_OPEN   0x20
+#define LOCK_CMD_RESULT 0x21
+#define LOCK_CMD_CANCEL 0x22
+#define LOCK_RES_OPENED    1
+#define LOCK_RES_CANCELLED 2
+#define LOCK_RES_STALE     3
+
+struct LockState { bool provisioned; uint8_t secret[32]; uint32_t boxId; uint32_t lastCtr; uint8_t lastRes; };
+static LockState lk = {false, {0}, 0, 0, 0};
+
+static void lockLoad() {
+  prefs.begin("meshbox", true);
+  lk.provisioned = prefs.isKey("lksecret") && prefs.getBytes("lksecret", lk.secret, 32) == 32;
+  lk.boxId = prefs.getUInt("lkboxid", 0);
+  lk.lastCtr = prefs.getUInt("lkctr", 0);
+  lk.lastRes = prefs.getUChar("lkres", 0);
+  prefs.end();
+}
+static void lockMac(const uint8_t *secret, const uint8_t *body, size_t n, uint8_t out8[8]) {
+  uint8_t full[32];
+  mbedtls_md_hmac(mbedtls_md_info_from_type(MBEDTLS_MD_SHA256), secret, 32, body, n, full);
+  memcpy(out8, full, 8);
+}
+// Fleet convention: first 12 hex chars of SHA-256 over the secret written as 64 lowercase hex characters.
+static void lockFingerprint(const uint8_t *secret, char out13[13]) {
+  static const char hx[] = "0123456789abcdef";
+  char hex[64]; for (int i = 0; i < 32; i++) { hex[2 * i] = hx[secret[i] >> 4]; hex[2 * i + 1] = hx[secret[i] & 15]; }
+  uint8_t d[32];
+  mbedtls_md(mbedtls_md_info_from_type(MBEDTLS_MD_SHA256), (const uint8_t *)hex, 64, d);
+  for (int i = 0; i < 6; i++) { out13[2 * i] = hx[d[i] >> 4]; out13[2 * i + 1] = hx[d[i] & 15]; }
+  out13[12] = 0;
+}
+static bool lockEq(const uint8_t *a, const uint8_t *b, size_t n) { uint8_t d = 0; for (size_t i = 0; i < n; i++) d |= a[i] ^ b[i]; return d == 0; }
+
+static void lockPrint() {
+  if (!lk.provisioned) { Serial.println("lock: not provisioned (L1 dry run)"); return; }
+  char fp[13]; lockFingerprint(lk.secret, fp);
+  Serial.printf("lock: provisioned box=!%08lx fingerprint=%s last counter=%lu last result=%u (L1 dry run, no pin driven)\n",
+                (unsigned long)lk.boxId, fp, (unsigned long)lk.lastCtr, lk.lastRes);
+}
+static void lockSendResult(uint8_t res, uint32_t ctr) {
+  uint8_t f[LOCK_FRAME_LEN] = {1, LOCK_CMD_RESULT, res};
+  memcpy(f + 3, &lk.boxId, 4); memcpy(f + 7, &ctr, 4);      // ESP32 is little-endian
+  lockMac(lk.secret, f, 11, f + 11);
+  linkSend(f, LOCK_FRAME_LEN);
+  Serial.printf("lock: result %u for counter %lu -> link\n", res, (unsigned long)ctr);
+}
+static void lockPulse() {
+  // L1: nothing is driven on any board. The real pulse (expander 0x27 GPA4, v2 only) is milestone L3.
+  Serial.println("lock: OPEN accepted -> DRY RUN, no pin driven");
+  patternStart(3, 2, 0, 255, 0, 3, OWNER_CMD);               // green flash as the visible stand-in
+}
+static void lockHandle(const uint8_t *f, size_t n, bool fromLink) {
+  if (!fromLink) { Serial.println("  lock frame refused: only accepted from the radio link"); return; }
+  if (n != LOCK_FRAME_LEN) { Serial.printf("  lock frame ignored: %d bytes, need %d (is this box's radio on L0?)\n", (int)n, LOCK_FRAME_LEN); return; }
+  if (!lk.provisioned) { Serial.println("  lock frame ignored: no secret provisioned"); return; }
+  uint8_t mac[8]; lockMac(lk.secret, f, 11, mac);
+  uint32_t id, ctr; memcpy(&id, f + 3, 4); memcpy(&ctr, f + 7, 4);
+  if (!lockEq(mac, f + 11, 8) || id != lk.boxId) { Serial.println("  lock frame ignored: bad signature or box id (no reply sent)"); return; }
+  if (ctr == lk.lastCtr && lk.lastRes) {                      // retry of the command already acted on: answer again, do nothing
+    Serial.printf("  lock: repeat of counter %lu, resending result\n", (unsigned long)ctr);
+    lockSendResult(lk.lastRes, ctr); return;
+  }
+  if (ctr <= lk.lastCtr) {
+    Serial.printf("  lock: stale counter %lu (last accepted %lu), nothing done\n", (unsigned long)ctr, (unsigned long)lk.lastCtr);
+    lockSendResult(LOCK_RES_STALE, ctr); return;
+  }
+  uint8_t res = (f[1] == LOCK_CMD_OPEN) ? LOCK_RES_OPENED : LOCK_RES_CANCELLED;
+  lk.lastCtr = ctr; lk.lastRes = res;
+  prefs.begin("meshbox", false); prefs.putUInt("lkctr", ctr); prefs.putUChar("lkres", res); prefs.end();   // stored BEFORE acting
+  if (res == LOCK_RES_OPENED) lockPulse();
+  else Serial.printf("lock: CANCEL accepted, counter now %lu\n", (unsigned long)ctr);
+  lockSendResult(res, ctr);
+}
+static int hexNib(char c) { if (c >= '0' && c <= '9') return c - '0'; c |= 0x20; return (c >= 'a' && c <= 'f') ? c - 'a' + 10 : -1; }
+// Known-answer test with the DUMMY secret 00..1f from the design document. Touches no stored state.
+static void lockSelfTest() {
+  uint8_t sec[32]; for (int i = 0; i < 32; i++) sec[i] = i;
+  const uint8_t body[11] = {0x01, 0x20, 0x00, 0x10, 0xfb, 0x16, 0x97, 0x7b, 0x69, 0xfb, 0x6a};
+  const uint8_t want[8] = {0x1e, 0x5d, 0x52, 0x75, 0xa4, 0x14, 0xaa, 0xc9};
+  uint8_t mac[8]; lockMac(sec, body, 11, mac);
+  char fp[13]; lockFingerprint(sec, fp);
+  bool ok1 = lockEq(mac, want, 8), ok2 = strcmp(fp, "6c86c6aac5fb") == 0;
+  Serial.printf("lock self-test: signature %s, fingerprint %s (%s)\n", ok1 ? "PASS" : "FAIL", ok2 ? "PASS" : "FAIL", fp);
+}
+// K | K T | K ERASE | K <boxid 8 hex> <secret 64 hex>
+static void lockConsole(const char *t) {
+  while (*t == ' ') t++;
+  if (*t == 0) { lockPrint(); return; }
+  if ((t[0] | 0x20) == 't' && t[1] == 0) { lockSelfTest(); return; }
+  if (strcasecmp(t, "ERASE") == 0) {
+    prefs.begin("meshbox", false); prefs.remove("lksecret"); prefs.remove("lkboxid"); prefs.remove("lkctr"); prefs.remove("lkres"); prefs.end();
+    memset(&lk, 0, sizeof(lk)); Serial.println("lock: secret erased"); lockPrint(); return;
+  }
+  if (strlen(t) != 8 + 1 + 64 || t[8] != ' ') { Serial.println("lock: use  K <boxid 8 hex> <secret 64 hex>  |  K  |  K T  |  K ERASE"); return; }
+  uint32_t id = 0; uint8_t sec[32];
+  for (int i = 0; i < 8; i++) { int v = hexNib(t[i]); if (v < 0) { Serial.println("lock: box id is not hex"); return; } id = (id << 4) | v; }
+  for (int i = 0; i < 32; i++) { int a = hexNib(t[9 + 2 * i]), b = hexNib(t[10 + 2 * i]); if (a < 0 || b < 0) { Serial.println("lock: secret is not hex"); return; } sec[i] = (a << 4) | b; }
+  memcpy(lk.secret, sec, 32); lk.boxId = id; lk.lastCtr = 0; lk.lastRes = 0; lk.provisioned = true;
+  prefs.begin("meshbox", false);
+  prefs.putBytes("lksecret", lk.secret, 32); prefs.putUInt("lkboxid", id); prefs.putUInt("lkctr", 0); prefs.putUChar("lkres", 0);
+  prefs.end();
+  Serial.println("lock: provisioned, counter reset to 0"); lockPrint();
+}
+
 // ---------------- frame handling (all transports) ----------------
 static uint8_t stripMask(uint8_t p2) { uint8_t sel = p2 >> 6; return (sel == 1) ? 1 : (sel == 2) ? 2 : 3; }
 
@@ -343,6 +458,8 @@ static void handleFrame(const uint8_t *f, size_t n, const char *src) {
       else Serial.printf("  group %u != mine (%u), ignored\n", f[7], cfg.group);
       break;
     case 0x10: Serial.printf("  event source=%u state=%u\n", f[2], f[3]); eventReact(f[2], f[3]); break;
+    case LOCK_CMD_OPEN: case LOCK_CMD_CANCEL: lockHandle(f, n, strcmp(src, "link") == 0); break;
+    case LOCK_CMD_RESULT: Serial.println("  lock result from another box (ignored)"); break;
     default:   Serial.printf("  unknown cmd %u\n", f[1]);
   }
 }
@@ -459,8 +576,9 @@ static void handleLine(const String &s) {
   const char *t = s.c_str() + 1;
   switch (s[0]) {
     case 'X': case 'x': patternStop(3, "console"); return;
-    case '?': hwPrint(); cfgPrint(); i2cProbe(true); return;
+    case '?': hwPrint(); cfgPrint(); lockPrint(); i2cProbe(true); return;
     case 'I': case 'i': i2cProbe(true); return;
+    case 'K': case 'k': lockConsole(t); return;
     case 'E': case 'e': { int n = sscanf(t, "%d %d", &a, &b); if (n >= 1) { emitEvent((uint8_t)a, n == 2 ? (uint8_t)b : 0); return; } break; }
     case 'C': case 'c': { int n = sscanf(t, "%d %d %d %d %d", &a, &b, &c, &d, &e);
       if (n >= 4) { uint8_t sel = (n == 5) ? (e & 3) : 0; uint8_t f[8] = {1, 1, (uint8_t)(sel << 6), (uint8_t)a, (uint8_t)b, (uint8_t)c, (uint8_t)(d & 0xFF), (uint8_t)(d >> 8)}; handleFrame(f, 8, "console"); return; } break; }
@@ -472,7 +590,7 @@ static void handleLine(const String &s) {
     case 'G': case 'g': if (sscanf(t, "%d", &a) == 1 && a >= 0 && a <= 255) { cfg.group = a; cfgSave(); cfgPrint(); return; } break;
     case 'H': case 'h': if (sscanf(t, "%d", &a) == 1 && a >= 0 && a <= 2) { cfg.hw = a; cfgSave(); Serial.println("hardware setting saved; rebooting to apply"); delay(200); ESP.restart(); } break;
   }
-  Serial.println("? P pat r g b secs [strip] | C r g b secs [strip] | X | E src [state] | N px1 | M px2 | B bright | G group | H hw | I | ?");
+  Serial.println("? P pat r g b secs [strip] | C r g b secs [strip] | X | E src [state] | N px1 | M px2 | B bright | G group | H hw | K (lock) | I | ?");
 }
 
 // ---------------- setup / loop ----------------
@@ -487,6 +605,7 @@ void setup() {
 
   Serial.begin(115200);
   cfgLoad();
+  lockLoad();
   periphLink.begin(LINK_BAUD, SERIAL_8N1, LINK_RX_PIN, LINK_TX_PIN);
 
   Wire.begin(SDA_PIN, SCL_PIN);
@@ -500,13 +619,14 @@ void setup() {
   randomSeed(esp_random());
   Serial.printf("meshbox-periph %s ready (link rx=%d tx=%d)\n", FW_VERSION, LINK_RX_PIN, LINK_TX_PIN);
   cfgPrint();
+  lockPrint();
 }
 
 void loop() {
   pollLink();
   pollInputs();
   if (blePending) { uint8_t f[8]; uint8_t n = bleLen; memcpy(f, bleFrame, n); blePending = false; handleFrame(f, n, "ble"); }
-  while (Serial.available()) { char c = Serial.read(); if (c == '\n' || c == '\r') { handleLine(line); line = ""; } else if (line.length() < 64) line += c; }
+  while (Serial.available()) { char c = Serial.read(); if (c == '\n' || c == '\r') { handleLine(line); line = ""; } else if (line.length() < 128) line += c; }
   patternTick(0); patternTick(1);
   stripsFlush();
 }
